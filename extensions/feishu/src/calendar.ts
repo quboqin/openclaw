@@ -1,0 +1,341 @@
+import { Type } from "@sinclair/typebox";
+import * as Lark from "@larksuiteoapi/node-sdk";
+import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
+import { readFile, writeFile } from "node:fs/promises";
+import { listEnabledFeishuAccounts } from "./accounts.js";
+import { createFeishuClient } from "./client.js";
+
+function json(data: unknown) {
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }],
+    details: data,
+  };
+}
+
+function toTimestampSeconds(input: string | number): string {
+  if (typeof input === "number") return String(Math.floor(input));
+  if (/^\d+$/.test(input)) return input;
+  const ms = Date.parse(input);
+  if (Number.isNaN(ms)) {
+    throw new Error(
+      `Invalid time: ${input}. Use unix seconds (number) or an ISO datetime string like 2026-02-23T10:00:00+08:00`,
+    );
+  }
+  return String(Math.floor(ms / 1000));
+}
+
+// ============ User Token (OAuth) Helpers ============
+
+const DEFAULT_REFRESH_TOKEN_PATH = "/home/openclaw/.openclaw/secrets/feishu_user_refresh_token";
+
+let cachedUserAccessToken: { token: string; expiresAtMs: number } | null = null;
+
+function getAuthenBaseUrl(domain?: string): string {
+  if (domain === "lark") return "https://open.larksuite.com";
+  return "https://open.feishu.cn";
+}
+
+async function loadRefreshToken(path = DEFAULT_REFRESH_TOKEN_PATH): Promise<string> {
+  const raw = await readFile(path, "utf8");
+  const token = raw.trim();
+  if (!token) throw new Error(`Empty refresh_token file: ${path}`);
+  return token;
+}
+
+async function persistRefreshToken(token: string, path = DEFAULT_REFRESH_TOKEN_PATH) {
+  const next = token.trim();
+  if (!next) return;
+  await writeFile(path, `${next}\n`, { encoding: "utf8", mode: 0o600 });
+}
+
+async function getUserAccessTokenFromRefresh(opts: {
+  appId: string;
+  appSecret: string;
+  domain?: string;
+  refreshTokenPath?: string;
+}): Promise<string> {
+  if (cachedUserAccessToken && Date.now() < cachedUserAccessToken.expiresAtMs - 60_000) {
+    return cachedUserAccessToken.token;
+  }
+
+  const refresh_token = await loadRefreshToken(opts.refreshTokenPath);
+  const url = `${getAuthenBaseUrl(opts.domain)}/open-apis/authen/v1/refresh_access_token`;
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      app_id: opts.appId,
+      app_secret: opts.appSecret,
+      grant_type: "refresh_token",
+      refresh_token,
+    }),
+  });
+
+  const body = (await res.json().catch(() => null)) as any;
+  if (!res.ok) {
+    throw new Error(`Refresh user access token failed: HTTP ${res.status} ${res.statusText}`);
+  }
+  if (!body || body.code !== 0) {
+    throw new Error(`Refresh user access token failed: ${body?.msg ?? "unknown error"}`);
+  }
+
+  const accessToken = body.data?.access_token as string | undefined;
+  const expiresIn = Number(body.data?.expires_in ?? 0);
+  const nextRefreshToken = body.data?.refresh_token as string | undefined;
+  if (!accessToken) throw new Error("Refresh user access token failed: missing access_token");
+
+  if (nextRefreshToken) {
+    await persistRefreshToken(nextRefreshToken, opts.refreshTokenPath);
+  }
+
+  cachedUserAccessToken = {
+    token: accessToken,
+    expiresAtMs: Date.now() + Math.max(0, expiresIn) * 1000,
+  };
+
+  return accessToken;
+}
+
+// ============ Core Actions ============
+
+async function listCalendars(
+  client: Lark.Client,
+  pageSize?: number,
+  pageToken?: string,
+  syncToken?: string,
+  userAccessToken?: string,
+) {
+  const res = await client.calendar.calendar.list(
+    {
+      params: {
+        ...(pageSize ? { page_size: pageSize } : {}),
+        ...(pageToken ? { page_token: pageToken } : {}),
+        ...(syncToken ? { sync_token: syncToken } : {}),
+      },
+    },
+    userAccessToken ? (Lark.withUserAccessToken(userAccessToken) as any) : undefined,
+  );
+
+  if (res.code !== 0) throw new Error(res.msg);
+
+  return {
+    calendars:
+      res.data?.calendar_list?.map((c) => ({
+        calendar_id: c.calendar_id,
+        summary: c.summary,
+        description: c.description,
+        type: c.type,
+        role: c.role,
+        permissions: c.permissions,
+        is_deleted: c.is_deleted,
+      })) ?? [],
+    has_more: res.data?.has_more ?? false,
+    page_token: res.data?.page_token,
+    sync_token: res.data?.sync_token,
+  };
+}
+
+async function listEvents(
+  client: Lark.Client,
+  calendarId: string,
+  startTime: string | number,
+  endTime: string | number,
+  pageSize?: number,
+  pageToken?: string,
+  userAccessToken?: string,
+) {
+  const res = await client.calendar.calendarEvent.list(
+    {
+      path: { calendar_id: calendarId },
+      params: {
+        start_time: toTimestampSeconds(startTime),
+        end_time: toTimestampSeconds(endTime),
+        ...(pageSize ? { page_size: pageSize } : {}),
+        ...(pageToken ? { page_token: pageToken } : {}),
+      },
+    },
+    userAccessToken ? (Lark.withUserAccessToken(userAccessToken) as any) : undefined,
+  );
+
+  if (res.code !== 0) throw new Error(res.msg);
+
+  return {
+    events:
+      res.data?.items?.map((e) => ({
+        event_id: e.event_id,
+        summary: e.summary,
+        description: e.description,
+        start_time: e.start_time,
+        end_time: e.end_time,
+        status: e.status,
+        location: e.location,
+        visibility: e.visibility,
+        free_busy_status: e.free_busy_status,
+        app_link: e.app_link,
+      })) ?? [],
+    has_more: res.data?.has_more ?? false,
+    page_token: res.data?.page_token,
+    sync_token: res.data?.sync_token,
+  };
+}
+
+async function createEvent(
+  client: Lark.Client,
+  calendarId: string,
+  summary: string,
+  startTime: string | number,
+  endTime: string | number,
+  opts?: {
+    description?: string;
+    timezone?: string;
+    location_name?: string;
+    need_notification?: boolean;
+    visibility?: "default" | "public" | "private";
+    free_busy_status?: "busy" | "free";
+  },
+  userAccessToken?: string,
+) {
+  const timezone = opts?.timezone ?? "Asia/Shanghai";
+  const res = await client.calendar.calendarEvent.create(
+    {
+      path: { calendar_id: calendarId },
+      data: {
+        summary,
+        ...(opts?.description ? { description: opts.description } : {}),
+        need_notification: opts?.need_notification ?? true,
+        start_time: { timestamp: toTimestampSeconds(startTime), timezone },
+        end_time: { timestamp: toTimestampSeconds(endTime), timezone },
+        ...(opts?.location_name ? { location: { name: opts.location_name } } : {}),
+        ...(opts?.visibility ? { visibility: opts.visibility } : {}),
+        ...(opts?.free_busy_status ? { free_busy_status: opts.free_busy_status } : {}),
+      },
+    },
+    userAccessToken ? (Lark.withUserAccessToken(userAccessToken) as any) : undefined,
+  );
+
+  if (res.code !== 0) throw new Error(res.msg);
+
+  return { event: res.data?.event };
+}
+
+export const FeishuCalendarSchema = Type.Object({
+  action: Type.Union([Type.Literal("calendars"), Type.Literal("events"), Type.Literal("create_event")]),
+  auth_mode: Type.Optional(Type.Union([Type.Literal("app"), Type.Literal("user")])),
+  user_access_token: Type.Optional(Type.String()),
+
+  page_size: Type.Optional(Type.Number({ minimum: 1, maximum: 500 })),
+  page_token: Type.Optional(Type.String()),
+  sync_token: Type.Optional(Type.String()),
+
+  calendar_id: Type.Optional(Type.String()),
+  start_time: Type.Optional(Type.Union([Type.Number(), Type.String()])),
+  end_time: Type.Optional(Type.Union([Type.Number(), Type.String()])),
+
+  summary: Type.Optional(Type.String()),
+  description: Type.Optional(Type.String()),
+  timezone: Type.Optional(Type.String()),
+  location_name: Type.Optional(Type.String()),
+  need_notification: Type.Optional(Type.Boolean()),
+  visibility: Type.Optional(Type.Union([Type.Literal("default"), Type.Literal("public"), Type.Literal("private")])) ,
+  free_busy_status: Type.Optional(Type.Union([Type.Literal("busy"), Type.Literal("free")])) ,
+});
+
+export type FeishuCalendarParams = {
+  action: "calendars" | "events" | "create_event";
+  auth_mode?: "app" | "user";
+  user_access_token?: string;
+  page_size?: number;
+  page_token?: string;
+  sync_token?: string;
+  calendar_id?: string;
+  start_time?: string | number;
+  end_time?: string | number;
+  summary?: string;
+  description?: string;
+  timezone?: string;
+  location_name?: string;
+  need_notification?: boolean;
+  visibility?: "default" | "public" | "private";
+  free_busy_status?: "busy" | "free";
+};
+
+export function registerFeishuCalendarTools(api: OpenClawPluginApi) {
+  if (!api.config) return;
+
+  const accounts = listEnabledFeishuAccounts(api.config);
+  if (accounts.length === 0) return;
+
+  const firstAccount = accounts[0];
+  const getClient = () => createFeishuClient(firstAccount);
+
+  const getUserToken = async (maybeToken?: string) => {
+    if (maybeToken) return maybeToken;
+    return await getUserAccessTokenFromRefresh({
+      appId: firstAccount.appId!,
+      appSecret: firstAccount.appSecret!,
+      domain: firstAccount.domain,
+    });
+  };
+
+  api.registerTool(
+    {
+      name: "feishu_calendar",
+      label: "Feishu Calendar",
+      description: "Feishu calendar operations. Actions: calendars, events, create_event",
+      parameters: FeishuCalendarSchema,
+      async execute(_toolCallId, params) {
+        const p = params as FeishuCalendarParams;
+        try {
+          const client = getClient();
+          const mode = p.auth_mode ?? "app";
+          const userToken = mode === "user" ? await getUserToken(p.user_access_token) : undefined;
+
+          switch (p.action) {
+            case "calendars":
+              return json(await listCalendars(client, p.page_size, p.page_token, p.sync_token, userToken));
+            case "events": {
+              if (!p.calendar_id) throw new Error("calendar_id is required for action=events");
+              if (p.start_time === undefined || p.end_time === undefined) {
+                throw new Error("start_time and end_time are required for action=events");
+              }
+              return json(
+                await listEvents(
+                  client,
+                  p.calendar_id,
+                  p.start_time,
+                  p.end_time,
+                  p.page_size,
+                  p.page_token,
+                  userToken,
+                ),
+              );
+            }
+            case "create_event": {
+              if (!p.calendar_id) throw new Error("calendar_id is required for action=create_event");
+              if (!p.summary) throw new Error("summary is required for action=create_event");
+              if (p.start_time === undefined || p.end_time === undefined) {
+                throw new Error("start_time and end_time are required for action=create_event");
+              }
+              return json(
+                await createEvent(client, p.calendar_id, p.summary, p.start_time, p.end_time, {
+                  description: p.description,
+                  timezone: p.timezone,
+                  location_name: p.location_name,
+                  need_notification: p.need_notification,
+                  visibility: p.visibility,
+                  free_busy_status: p.free_busy_status,
+                }, userToken),
+              );
+            }
+            default:
+              return json({ error: `Unknown action: ${(p as any).action}` });
+          }
+        } catch (err) {
+          return json({ error: err instanceof Error ? err.message : String(err) });
+        }
+      },
+    },
+    { name: "feishu_calendar" },
+  );
+}
